@@ -757,8 +757,10 @@ bitflags::bitflags! {
         ///
         /// This is a native only feature.
         const SHADER_EARLY_DEPTH_TEST = 1 << 62;
+        /// Custom feature test
+        const FOO = 1 << 63;
 
-        // 62..64 available
+        // 63..64 available
     }
 }
 
