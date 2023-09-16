@@ -43,8 +43,9 @@ impl super::Adapter {
                     src = &src[pos + es_sig.len()..];
                 }
                 None => {
-                    log::warn!("ES not found in '{}'", src);
-                    return Err(crate::InstanceError);
+                    return Err(crate::InstanceError::new(format!(
+                        "OpenGL version {src:?} does not contain 'ES'"
+                    )));
                 }
             }
         };
@@ -86,10 +87,9 @@ impl super::Adapter {
                 },
                 minor,
             )),
-            _ => {
-                log::warn!("Unable to extract the version from '{}'", version);
-                Err(crate::InstanceError)
-            }
+            _ => Err(crate::InstanceError::new(format!(
+                "unable to extract OpenGL version from {version:?}"
+            ))),
         }
     }
 
@@ -170,7 +170,7 @@ impl super::Adapter {
 
         wgt::AdapterInfo {
             name: renderer_orig,
-            vendor: vendor_id as usize,
+            vendor: vendor_id,
             device: 0,
             device_type: inferred_device_type,
             driver: String::new(),
@@ -397,8 +397,27 @@ impl super::Adapter {
         if extensions.contains("WEBGL_compressed_texture_astc")
             || extensions.contains("GL_OES_texture_compression_astc")
         {
-            features.insert(wgt::Features::TEXTURE_COMPRESSION_ASTC);
-            features.insert(wgt::Features::TEXTURE_COMPRESSION_ASTC_HDR);
+            #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
+            {
+                if context
+                    .glow_context
+                    .compressed_texture_astc_supports_ldr_profile()
+                {
+                    features.insert(wgt::Features::TEXTURE_COMPRESSION_ASTC);
+                }
+                if context
+                    .glow_context
+                    .compressed_texture_astc_supports_hdr_profile()
+                {
+                    features.insert(wgt::Features::TEXTURE_COMPRESSION_ASTC_HDR);
+                }
+            }
+
+            #[cfg(any(not(target_arch = "wasm32"), target_os = "emscripten"))]
+            {
+                features.insert(wgt::Features::TEXTURE_COMPRESSION_ASTC);
+                features.insert(wgt::Features::TEXTURE_COMPRESSION_ASTC_HDR);
+            }
         } else {
             features.set(
                 wgt::Features::TEXTURE_COMPRESSION_ASTC,
@@ -557,6 +576,7 @@ impl super::Adapter {
             },
             max_compute_workgroups_per_dimension,
             max_buffer_size: i32::MAX as u64,
+            max_non_sampler_bindings: std::u32::MAX,
         };
 
         let mut workarounds = super::Workarounds::empty();
@@ -585,9 +605,9 @@ impl super::Adapter {
         let downlevel_defaults = wgt::DownlevelLimits {};
 
         // Drop the GL guard so we can move the context into AdapterShared
-        // ( on WASM the gl handle is just a ref so we tell clippy to allow
+        // ( on Wasm the gl handle is just a ref so we tell clippy to allow
         // dropping the ref )
-        #[allow(clippy::drop_ref)]
+        #[cfg_attr(target_arch = "wasm32", allow(clippy::drop_ref))]
         drop(gl);
 
         Some(crate::ExposedAdapter {
@@ -713,10 +733,12 @@ impl crate::Adapter<super::Api> for super::Adapter {
                     | Tfc::MULTISAMPLE_X16
             } else if max_samples >= 8 {
                 Tfc::MULTISAMPLE_X2 | Tfc::MULTISAMPLE_X4 | Tfc::MULTISAMPLE_X8
-            } else if max_samples >= 4 {
-                Tfc::MULTISAMPLE_X2 | Tfc::MULTISAMPLE_X4
             } else {
-                Tfc::MULTISAMPLE_X2
+                // The lowest supported level in GLE3.0/WebGL2 is 4X
+                // (see GL_MAX_SAMPLES in https://registry.khronos.org/OpenGL-Refpages/es3.0/html/glGet.xhtml).
+                // On some platforms, like iOS Safari, `get_parameter_i32(MAX_SAMPLES)` returns 0,
+                // so we always fall back to supporting 4x here.
+                Tfc::MULTISAMPLE_X2 | Tfc::MULTISAMPLE_X4
             }
         };
 
@@ -934,10 +956,17 @@ impl super::AdapterShared {
     }
 }
 
-// SAFE: WASM doesn't have threads
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(
+    target_arch = "wasm32",
+    feature = "fragile-send-sync-non-atomic-wasm",
+    not(target_feature = "atomics")
+))]
 unsafe impl Sync for super::Adapter {}
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(
+    target_arch = "wasm32",
+    feature = "fragile-send-sync-non-atomic-wasm",
+    not(target_feature = "atomics")
+))]
 unsafe impl Send for super::Adapter {}
 
 #[cfg(test)]
@@ -946,27 +975,30 @@ mod tests {
 
     #[test]
     fn test_version_parse() {
-        let error = Err(crate::InstanceError);
-        assert_eq!(Adapter::parse_version("1"), error);
-        assert_eq!(Adapter::parse_version("1."), error);
-        assert_eq!(Adapter::parse_version("1 h3l1o. W0rld"), error);
-        assert_eq!(Adapter::parse_version("1. h3l1o. W0rld"), error);
-        assert_eq!(Adapter::parse_version("1.2.3"), error);
-        assert_eq!(Adapter::parse_version("OpenGL ES 3.1"), Ok((3, 1)));
+        Adapter::parse_version("1").unwrap_err();
+        Adapter::parse_version("1.").unwrap_err();
+        Adapter::parse_version("1 h3l1o. W0rld").unwrap_err();
+        Adapter::parse_version("1. h3l1o. W0rld").unwrap_err();
+        Adapter::parse_version("1.2.3").unwrap_err();
+
+        assert_eq!(Adapter::parse_version("OpenGL ES 3.1").unwrap(), (3, 1));
         assert_eq!(
-            Adapter::parse_version("OpenGL ES 2.0 Google Nexus"),
-            Ok((2, 0))
+            Adapter::parse_version("OpenGL ES 2.0 Google Nexus").unwrap(),
+            (2, 0)
         );
-        assert_eq!(Adapter::parse_version("GLSL ES 1.1"), Ok((1, 1)));
-        assert_eq!(Adapter::parse_version("OpenGL ES GLSL ES 3.20"), Ok((3, 2)));
+        assert_eq!(Adapter::parse_version("GLSL ES 1.1").unwrap(), (1, 1));
+        assert_eq!(
+            Adapter::parse_version("OpenGL ES GLSL ES 3.20").unwrap(),
+            (3, 2)
+        );
         assert_eq!(
             // WebGL 2.0 should parse as OpenGL ES 3.0
-            Adapter::parse_version("WebGL 2.0 (OpenGL ES 3.0 Chromium)"),
-            Ok((3, 0))
+            Adapter::parse_version("WebGL 2.0 (OpenGL ES 3.0 Chromium)").unwrap(),
+            (3, 0)
         );
         assert_eq!(
-            Adapter::parse_version("WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)"),
-            Ok((3, 0))
+            Adapter::parse_version("WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)").unwrap(),
+            (3, 0)
         );
     }
 }

@@ -14,12 +14,49 @@ unsafe extern "system" fn debug_utils_messenger_callback(
     message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     message_type: vk::DebugUtilsMessageTypeFlagsEXT,
     callback_data_ptr: *const vk::DebugUtilsMessengerCallbackDataEXT,
-    _user_data: *mut c_void,
+    user_data: *mut c_void,
 ) -> vk::Bool32 {
-    const VUID_VKSWAPCHAINCREATEINFOKHR_IMAGEEXTENT_01274: i32 = 0x7cd0911d;
     use std::borrow::Cow;
 
     if thread::panicking() {
+        return vk::FALSE;
+    }
+
+    let cd = unsafe { &*callback_data_ptr };
+    let user_data = unsafe { &*(user_data as *mut super::DebugUtilsMessengerUserData) };
+
+    const VUID_VKCMDENDDEBUGUTILSLABELEXT_COMMANDBUFFER_01912: i32 = 0x56146426;
+    if cd.message_id_number == VUID_VKCMDENDDEBUGUTILSLABELEXT_COMMANDBUFFER_01912 {
+        // https://github.com/KhronosGroup/Vulkan-ValidationLayers/issues/5671
+        // Versions 1.3.240 through 1.3.250 return a spurious error here if
+        // the debug range start and end appear in different command buffers.
+        let khronos_validation_layer =
+            std::ffi::CStr::from_bytes_with_nul(b"Khronos Validation Layer\0").unwrap();
+        if user_data.validation_layer_description.as_ref() == khronos_validation_layer
+            && user_data.validation_layer_spec_version >= vk::make_api_version(0, 1, 3, 240)
+            && user_data.validation_layer_spec_version <= vk::make_api_version(0, 1, 3, 250)
+        {
+            return vk::FALSE;
+        }
+    }
+
+    // Silence Vulkan Validation error "VUID-VkSwapchainCreateInfoKHR-imageExtent-01274"
+    // - it's a false positive due to the inherent racy-ness of surface resizing
+    const VUID_VKSWAPCHAINCREATEINFOKHR_IMAGEEXTENT_01274: i32 = 0x7cd0911d;
+    if cd.message_id_number == VUID_VKSWAPCHAINCREATEINFOKHR_IMAGEEXTENT_01274 {
+        return vk::FALSE;
+    }
+
+    // Silence Vulkan Validation error "VUID-VkRenderPassBeginInfo-framebuffer-04627"
+    // if the OBS layer is enabled. This is a bug in the OBS layer. As the OBS layer
+    // does not have a version number they increment, there is no way to qualify the
+    // supression of the error to a specific version of the OBS layer.
+    //
+    // See https://github.com/obsproject/obs-studio/issues/9353
+    const VUID_VKRENDERPASSBEGININFO_FRAMEBUFFER_04627: i32 = 0x45125641;
+    if cd.message_id_number == VUID_VKRENDERPASSBEGININFO_FRAMEBUFFER_04627
+        && user_data.has_obs_layer
+    {
         return vk::FALSE;
     }
 
@@ -31,8 +68,6 @@ unsafe extern "system" fn debug_utils_messenger_callback(
         _ => log::Level::Warn,
     };
 
-    let cd = unsafe { &*callback_data_ptr };
-
     let message_id_name = if cd.p_message_id_name.is_null() {
         Cow::from("")
     } else {
@@ -43,12 +78,6 @@ unsafe extern "system" fn debug_utils_messenger_callback(
     } else {
         unsafe { CStr::from_ptr(cd.p_message) }.to_string_lossy()
     };
-
-    // Silence Vulkan Validation error "VUID-VkSwapchainCreateInfoKHR-imageExtent-01274"
-    // - it's a false positive due to the inherent racy-ness of surface resizing
-    if cd.message_id_number == VUID_VKSWAPCHAINCREATEINFOKHR_IMAGEEXTENT_01274 {
-        return vk::FALSE;
-    }
 
     let _ = std::panic::catch_unwind(|| {
         log::log!(
@@ -165,8 +194,10 @@ impl super::Instance {
         let instance_extensions = entry
             .enumerate_instance_extension_properties(None)
             .map_err(|e| {
-                log::info!("enumerate_instance_extension_properties: {:?}", e);
-                crate::InstanceError
+                crate::InstanceError::with_source(
+                    String::from("enumerate_instance_extension_properties() failed"),
+                    e,
+                )
             })?;
 
         // Check our extensions against the available extensions
@@ -199,6 +230,7 @@ impl super::Instance {
         if cfg!(target_os = "macos") {
             // VK_EXT_metal_surface
             extensions.push(ext::MetalSurface::name());
+            extensions.push(ash::vk::KhrPortabilityEnumerationFn::name());
         }
 
         if flags.contains(crate::InstanceFlags::DEBUG) {
@@ -236,12 +268,16 @@ impl super::Instance {
     /// - `extensions` must be a superset of `required_extensions()` and must be created from the
     ///   same entry, driver_api_version and flags.
     /// - `android_sdk_version` is ignored and can be `0` for all platforms besides Android
+    ///
+    /// If `debug_utils_user_data` is `Some`, then the validation layer is
+    /// available, so create a [`vk::DebugUtilsMessengerEXT`].
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn from_raw(
         entry: ash::Entry,
         raw_instance: ash::Instance,
         driver_api_version: u32,
         android_sdk_version: u32,
+        debug_utils_user_data: Option<super::DebugUtilsMessengerUserData>,
         extensions: Vec<&'static CStr>,
         flags: crate::InstanceFlags,
         has_nv_optimus: bool,
@@ -249,36 +285,52 @@ impl super::Instance {
     ) -> Result<Self, crate::InstanceError> {
         log::info!("Instance version: 0x{:x}", driver_api_version);
 
-        let debug_utils = if extensions.contains(&ext::DebugUtils::name()) {
-            log::info!("Enabling debug utils");
-            let extension = ext::DebugUtils::new(&entry, &raw_instance);
-            // having ERROR unconditionally because Vk doesn't like empty flags
-            let mut severity = vk::DebugUtilsMessageSeverityFlagsEXT::ERROR;
-            if log::max_level() >= log::LevelFilter::Debug {
-                severity |= vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE;
+        let debug_utils = if let Some(debug_callback_user_data) = debug_utils_user_data {
+            if extensions.contains(&ext::DebugUtils::name()) {
+                log::info!("Enabling debug utils");
+                // Move the callback data to the heap, to ensure it will never be
+                // moved.
+                let callback_data = Box::new(debug_callback_user_data);
+
+                let extension = ext::DebugUtils::new(&entry, &raw_instance);
+                // having ERROR unconditionally because Vk doesn't like empty flags
+                let mut severity = vk::DebugUtilsMessageSeverityFlagsEXT::ERROR;
+                if log::max_level() >= log::LevelFilter::Debug {
+                    severity |= vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE;
+                }
+                if log::max_level() >= log::LevelFilter::Info {
+                    severity |= vk::DebugUtilsMessageSeverityFlagsEXT::INFO;
+                }
+                if log::max_level() >= log::LevelFilter::Warn {
+                    severity |= vk::DebugUtilsMessageSeverityFlagsEXT::WARNING;
+                }
+                let user_data_ptr: *const super::DebugUtilsMessengerUserData = &*callback_data;
+                let vk_info = vk::DebugUtilsMessengerCreateInfoEXT::builder()
+                    .flags(vk::DebugUtilsMessengerCreateFlagsEXT::empty())
+                    .message_severity(severity)
+                    .message_type(
+                        vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                            | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                            | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+                    )
+                    .pfn_user_callback(Some(debug_utils_messenger_callback))
+                    .user_data(user_data_ptr as *mut _);
+                let messenger =
+                    unsafe { extension.create_debug_utils_messenger(&vk_info, None) }.unwrap();
+                Some(super::DebugUtils {
+                    extension,
+                    messenger,
+                    callback_data,
+                })
+            } else {
+                log::info!("Debug utils not enabled: extension not listed");
+                None
             }
-            if log::max_level() >= log::LevelFilter::Info {
-                severity |= vk::DebugUtilsMessageSeverityFlagsEXT::INFO;
-            }
-            if log::max_level() >= log::LevelFilter::Warn {
-                severity |= vk::DebugUtilsMessageSeverityFlagsEXT::WARNING;
-            }
-            let vk_info = vk::DebugUtilsMessengerCreateInfoEXT::builder()
-                .flags(vk::DebugUtilsMessengerCreateFlagsEXT::empty())
-                .message_severity(severity)
-                .message_type(
-                    vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-                        | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
-                        | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
-                )
-                .pfn_user_callback(Some(debug_utils_messenger_callback));
-            let messenger =
-                unsafe { extension.create_debug_utils_messenger(&vk_info, None) }.unwrap();
-            Some(super::DebugUtils {
-                extension,
-                messenger,
-            })
         } else {
+            log::info!(
+                "Debug utils not enabled: \
+                        debug_utils_user_data not passed to Instance::from_raw"
+            );
             None
         };
 
@@ -316,8 +368,9 @@ impl super::Instance {
         window: vk::Window,
     ) -> Result<super::Surface, crate::InstanceError> {
         if !self.shared.extensions.contains(&khr::XlibSurface::name()) {
-            log::warn!("Vulkan driver does not support VK_KHR_xlib_surface");
-            return Err(crate::InstanceError);
+            return Err(crate::InstanceError::new(String::from(
+                "Vulkan driver does not support VK_KHR_xlib_surface",
+            )));
         }
 
         let surface = {
@@ -341,8 +394,9 @@ impl super::Instance {
         window: vk::xcb_window_t,
     ) -> Result<super::Surface, crate::InstanceError> {
         if !self.shared.extensions.contains(&khr::XcbSurface::name()) {
-            log::warn!("Vulkan driver does not support VK_KHR_xcb_surface");
-            return Err(crate::InstanceError);
+            return Err(crate::InstanceError::new(String::from(
+                "Vulkan driver does not support VK_KHR_xcb_surface",
+            )));
         }
 
         let surface = {
@@ -370,8 +424,9 @@ impl super::Instance {
             .extensions
             .contains(&khr::WaylandSurface::name())
         {
-            log::debug!("Vulkan driver does not support VK_KHR_wayland_surface");
-            return Err(crate::InstanceError);
+            return Err(crate::InstanceError::new(String::from(
+                "Vulkan driver does not support VK_KHR_wayland_surface",
+            )));
         }
 
         let surface = {
@@ -397,8 +452,9 @@ impl super::Instance {
             .extensions
             .contains(&khr::AndroidSurface::name())
         {
-            log::warn!("Vulkan driver does not support VK_KHR_android_surface");
-            return Err(crate::InstanceError);
+            return Err(crate::InstanceError::new(String::from(
+                "Vulkan driver does not support VK_KHR_android_surface",
+            )));
         }
 
         let surface = {
@@ -420,8 +476,9 @@ impl super::Instance {
         hwnd: *mut c_void,
     ) -> Result<super::Surface, crate::InstanceError> {
         if !self.shared.extensions.contains(&khr::Win32Surface::name()) {
-            log::debug!("Vulkan driver does not support VK_KHR_win32_surface");
-            return Err(crate::InstanceError);
+            return Err(crate::InstanceError::new(String::from(
+                "Vulkan driver does not support VK_KHR_win32_surface",
+            )));
         }
 
         let surface = {
@@ -446,8 +503,9 @@ impl super::Instance {
         view: *mut c_void,
     ) -> Result<super::Surface, crate::InstanceError> {
         if !self.shared.extensions.contains(&ext::MetalSurface::name()) {
-            log::warn!("Vulkan driver does not support VK_EXT_metal_surface");
-            return Err(crate::InstanceError);
+            return Err(crate::InstanceError::new(String::from(
+                "Vulkan driver does not support VK_EXT_metal_surface",
+            )));
         }
 
         let layer = unsafe {
@@ -496,20 +554,18 @@ impl crate::Instance<super::Api> for super::Instance {
     unsafe fn init(desc: &crate::InstanceDescriptor) -> Result<Self, crate::InstanceError> {
         use crate::auxil::cstr_from_bytes_until_nul;
 
-        let entry = match unsafe { ash::Entry::load() } {
-            Ok(entry) => entry,
-            Err(err) => {
-                log::info!("Missing Vulkan entry points: {:?}", err);
-                return Err(crate::InstanceError);
-            }
-        };
+        let entry = unsafe { ash::Entry::load() }.map_err(|err| {
+            crate::InstanceError::with_source(String::from("missing Vulkan entry points"), err)
+        })?;
         let driver_api_version = match entry.try_enumerate_instance_version() {
             // Vulkan 1.1+
             Ok(Some(version)) => version,
             Ok(None) => vk::API_VERSION_1_0,
             Err(err) => {
-                log::warn!("try_enumerate_instance_version: {:?}", err);
-                return Err(crate::InstanceError);
+                return Err(crate::InstanceError::with_source(
+                    String::from("try_enumerate_instance_version() failed"),
+                    err,
+                ));
             }
         };
 
@@ -540,34 +596,52 @@ impl crate::Instance<super::Api> for super::Instance {
 
         let instance_layers = entry.enumerate_instance_layer_properties().map_err(|e| {
             log::info!("enumerate_instance_layer_properties: {:?}", e);
-            crate::InstanceError
+            crate::InstanceError::with_source(
+                String::from("enumerate_instance_layer_properties() failed"),
+                e,
+            )
         })?;
 
+        fn find_layer<'layers>(
+            instance_layers: &'layers [vk::LayerProperties],
+            name: &CStr,
+        ) -> Option<&'layers vk::LayerProperties> {
+            instance_layers
+                .iter()
+                .find(|inst_layer| cstr_from_bytes_until_nul(&inst_layer.layer_name) == Some(name))
+        }
+
         let nv_optimus_layer = CStr::from_bytes_with_nul(b"VK_LAYER_NV_optimus\0").unwrap();
-        let has_nv_optimus = instance_layers.iter().any(|inst_layer| {
-            cstr_from_bytes_until_nul(&inst_layer.layer_name) == Some(nv_optimus_layer)
-        });
+        let has_nv_optimus = find_layer(&instance_layers, nv_optimus_layer).is_some();
 
-        // Check requested layers against the available layers
-        let layers = {
-            let mut layers: Vec<&'static CStr> = Vec::new();
-            if desc.flags.contains(crate::InstanceFlags::VALIDATION) {
-                layers.push(CStr::from_bytes_with_nul(b"VK_LAYER_KHRONOS_validation\0").unwrap());
+        let obs_layer = CStr::from_bytes_with_nul(b"VK_LAYER_OBS_HOOK\0").unwrap();
+        let has_obs_layer = find_layer(&instance_layers, obs_layer).is_some();
+
+        let mut layers: Vec<&'static CStr> = Vec::new();
+
+        // Request validation layer if asked.
+        let mut debug_callback_user_data = None;
+        if desc.flags.contains(crate::InstanceFlags::VALIDATION) {
+            let validation_layer_name =
+                CStr::from_bytes_with_nul(b"VK_LAYER_KHRONOS_validation\0").unwrap();
+            if let Some(layer_properties) = find_layer(&instance_layers, validation_layer_name) {
+                layers.push(validation_layer_name);
+                debug_callback_user_data = Some(super::DebugUtilsMessengerUserData {
+                    validation_layer_description: cstr_from_bytes_until_nul(
+                        &layer_properties.description,
+                    )
+                    .unwrap()
+                    .to_owned(),
+                    validation_layer_spec_version: layer_properties.spec_version,
+                    has_obs_layer,
+                });
+            } else {
+                log::warn!(
+                    "InstanceFlags::VALIDATION requested, but unable to find layer: {}",
+                    validation_layer_name.to_string_lossy()
+                );
             }
-
-            // Only keep available layers.
-            layers.retain(|&layer| {
-                if instance_layers.iter().any(|inst_layer| {
-                    cstr_from_bytes_until_nul(&inst_layer.layer_name) == Some(layer)
-                }) {
-                    true
-                } else {
-                    log::warn!("Unable to find layer: {}", layer.to_string_lossy());
-                    false
-                }
-            });
-            layers
-        };
+        }
 
         #[cfg(target_os = "android")]
         let android_sdk_version = {
@@ -591,6 +665,15 @@ impl crate::Instance<super::Api> for super::Instance {
         #[cfg(not(target_os = "android"))]
         let android_sdk_version = 0;
 
+        let mut flags = vk::InstanceCreateFlags::empty();
+
+        // Avoid VUID-VkInstanceCreateInfo-flags-06559: Only ask the instance to
+        // enumerate incomplete Vulkan implementations (which we need on Mac) if
+        // we managed to find the extension that provides the flag.
+        if extensions.contains(&ash::vk::KhrPortabilityEnumerationFn::name()) {
+            flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
+        }
+
         let vk_instance = {
             let str_pointers = layers
                 .iter()
@@ -602,14 +685,16 @@ impl crate::Instance<super::Api> for super::Instance {
                 .collect::<Vec<_>>();
 
             let create_info = vk::InstanceCreateInfo::builder()
-                .flags(vk::InstanceCreateFlags::empty())
+                .flags(flags)
                 .application_info(&app_info)
                 .enabled_layer_names(&str_pointers[..layers.len()])
                 .enabled_extension_names(&str_pointers[layers.len()..]);
 
             unsafe { entry.create_instance(&create_info, None) }.map_err(|e| {
-                log::warn!("create_instance: {:?}", e);
-                crate::InstanceError
+                crate::InstanceError::with_source(
+                    String::from("Entry::create_instance() failed"),
+                    e,
+                )
             })?
         };
 
@@ -619,6 +704,7 @@ impl crate::Instance<super::Api> for super::Instance {
                 vk_instance,
                 driver_api_version,
                 android_sdk_version,
+                debug_callback_user_data,
                 extensions,
                 desc.flags,
                 has_nv_optimus,
@@ -664,7 +750,9 @@ impl crate::Instance<super::Api> for super::Instance {
             {
                 self.create_surface_from_view(handle.ui_view)
             }
-            (_, _) => Err(crate::InstanceError),
+            (_, _) => Err(crate::InstanceError::new(format!(
+                "window handle {window_handle:?} is not a Vulkan-compatible handle"
+            ))),
         }
     }
 
@@ -691,12 +779,12 @@ impl crate::Instance<super::Api> for super::Instance {
         // Detect if it's an Intel + NVidia configuration with Optimus
         let has_nvidia_dgpu = exposed_adapters.iter().any(|exposed| {
             exposed.info.device_type == wgt::DeviceType::DiscreteGpu
-                && exposed.info.vendor == db::nvidia::VENDOR as usize
+                && exposed.info.vendor == db::nvidia::VENDOR
         });
         if cfg!(target_os = "linux") && has_nvidia_dgpu && self.shared.has_nv_optimus {
             for exposed in exposed_adapters.iter_mut() {
                 if exposed.info.device_type == wgt::DeviceType::IntegratedGpu
-                    && exposed.info.vendor == db::intel::VENDOR as usize
+                    && exposed.info.vendor == db::intel::VENDOR
                 {
                     // See https://gitlab.freedesktop.org/mesa/mesa/-/issues/4688
                     log::warn!(
