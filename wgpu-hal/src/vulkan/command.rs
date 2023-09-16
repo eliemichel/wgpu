@@ -606,6 +606,11 @@ impl crate::CommandEncoder<super::Api> for super::CommandEncoder {
     }
 
     unsafe fn set_render_pipeline(&mut self, pipeline: &super::RenderPipeline) {
+        // Debug print
+        if let Some(foo) = pipeline.foo {
+            println!("DEBUG of FOO feature: foo={:?}", foo);
+        }
+        
         unsafe {
             self.device.raw.cmd_bind_pipeline(
                 self.active,

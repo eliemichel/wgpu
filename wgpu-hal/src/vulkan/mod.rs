@@ -436,6 +436,7 @@ pub enum ShaderModule {
 #[derive(Debug)]
 pub struct RenderPipeline {
     raw: vk::Pipeline,
+    foo: Option<u32>,
 }
 
 #[derive(Debug)]

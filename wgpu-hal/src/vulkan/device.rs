@@ -1791,7 +1791,9 @@ impl crate::Device<super::Api> for super::Device {
             unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };
         }
 
-        Ok(super::RenderPipeline { raw })
+        let foo = desc.foo;
+
+        Ok(super::RenderPipeline { raw, foo })
     }
     unsafe fn destroy_render_pipeline(&self, pipeline: super::RenderPipeline) {
         unsafe { self.shared.raw.destroy_pipeline(pipeline.raw, None) };

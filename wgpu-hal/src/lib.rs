@@ -1178,6 +1178,8 @@ pub struct RenderPipelineDescriptor<'a, A: Api> {
     /// If the pipeline will be used with a multiview render pass, this indicates how many array
     /// layers the attachments will have.
     pub multiview: Option<NonZeroU32>,
+    /// Our custom FOO extension
+    pub foo: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
