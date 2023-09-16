@@ -1191,6 +1191,7 @@ impl crate::Context for Context {
                 targets: Borrowed(frag.targets),
             }),
             multiview: desc.multiview,
+            foo: desc.foo,
         };
 
         let global = &self.0;
